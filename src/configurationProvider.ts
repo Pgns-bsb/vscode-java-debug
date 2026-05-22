@@ -6,48 +6,97 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 
-import { instrumentOperation } from "vscode-extension-telemetry-wrapper";
+import * as dotenv from 'dotenv';
+
+import { instrumentOperation, sendError, sendInfo, setUserError } from "vscode-extension-telemetry-wrapper";
 import * as anchor from "./anchor";
+import { buildWorkspace } from "./build";
+import { populateStepFilters, substituteFilterVariables } from "./classFilter";
 import * as commands from "./commands";
+import { ClasspathVariable } from "./constants";
+import { Type } from "./javaLogger";
 import * as lsPlugin from "./languageServerPlugin";
-import { logger, Type } from "./logger";
+import { addMoreHelpfulVMArgs, getJavaVersion, getShortenApproachForCLI, validateRuntimeCompatibility } from "./launchCommand";
+import { mainClassPicker } from "./mainClassPicker";
+import { resolveJavaProcess } from "./processPicker";
+import { IProgressReporter } from "./progressAPI";
+import { progressProvider } from "./progressImpl";
 import * as utility from "./utility";
-import { VariableResolver } from "./variableResolver";
+
+const platformNameMappings: { [key: string]: string } = {
+    win32: "windows",
+    linux: "linux",
+    darwin: "osx",
+};
+const platformName = platformNameMappings[process.platform];
+
+export let lastUsedLaunchConfig: vscode.DebugConfiguration | undefined;
 
 export class JavaDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
     private isUserSettingsDirty: boolean = true;
-    private debugHistory: MostRecentlyUsedHistory = new MostRecentlyUsedHistory();
-    private resolver: VariableResolver;
     constructor() {
-        this.resolver = new VariableResolver();
+        const packageJson: {[key: string]: any} = require("../package.json");
+        const debugConfigNames = Object.keys(packageJson?.contributes?.configuration?.properties || {});
         vscode.workspace.onDidChangeConfiguration((event) => {
-            if (vscode.debug.activeDebugSession) {
-                this.isUserSettingsDirty = false;
-                return updateDebugSettings();
-            } else {
-                this.isUserSettingsDirty = true;
+            if (event.affectsConfiguration("java.debug")) {
+                for (const key of debugConfigNames) {
+                    if (event.affectsConfiguration(key)) {
+                        sendInfo("", {
+                            operationName: "changeJavaDebugSettings",
+                            configName: key,
+                        });
+                    }
+                }
+
+                if (vscode.debug.activeDebugSession) {
+                    this.isUserSettingsDirty = false;
+                    return updateDebugSettings(event);
+                } else {
+                    this.isUserSettingsDirty = true;
+                }
             }
+            return undefined;
         });
     }
 
     // Returns an initial debug configurations based on contextual information.
     public provideDebugConfigurations(folder: vscode.WorkspaceFolder | undefined, token?: vscode.CancellationToken):
         vscode.ProviderResult<vscode.DebugConfiguration[]> {
-        const provideDebugConfigurationsHandler = instrumentOperation("provideDebugConfigurations", (operationId: string) => {
-            return <Thenable<vscode.DebugConfiguration[]>>this.provideDebugConfigurationsAsync(folder);
+        const provideDebugConfigurationsHandler = instrumentOperation("provideDebugConfigurations", (_operationId: string) => {
+            return <Thenable<vscode.DebugConfiguration[]>>this.provideDebugConfigurationsAsync(folder, token);
         });
         return provideDebugConfigurationsHandler();
     }
 
     // Try to add all missing attributes to the debug configuration being launched.
-    public resolveDebugConfiguration(folder: vscode.WorkspaceFolder | undefined, config: vscode.DebugConfiguration, token?: vscode.CancellationToken):
+    public resolveDebugConfiguration(_folder: vscode.WorkspaceFolder | undefined,
+                                     config: vscode.DebugConfiguration, _token?: vscode.CancellationToken):
         vscode.ProviderResult<vscode.DebugConfiguration> {
-        const resolveDebugConfigurationHandler = instrumentOperation("resolveDebugConfiguration", (operationId: string) => {
+        // If no debug configuration is provided, then generate one in memory.
+        if (this.isEmptyConfig(config)) {
+            config.type = "java";
+            config.name = "Java Debug";
+            config.request = "launch";
+            config.__origin = "internal";
+        }
+
+        return config;
+    }
+
+    // Try to add all missing attributes to the debug configuration being launched.
+    public resolveDebugConfigurationWithSubstitutedVariables(
+        folder: vscode.WorkspaceFolder | undefined,
+        config: vscode.DebugConfiguration,
+        token?: vscode.CancellationToken): vscode.ProviderResult<vscode.DebugConfiguration> {
+        const resolveDebugConfigurationHandler = instrumentOperation("resolveDebugConfiguration", (_operationId: string) => {
             try {
-                this.resolveVariables(folder, config);
-                return this.heuristicallyResolveDebugConfiguration(folder, config);
+                // See https://github.com/microsoft/vscode-java-debug/issues/778
+                // Merge the platform specific properties to the global config to simplify the subsequent resolving logic.
+                this.mergePlatformProperties(config, folder);
+                return this.resolveAndValidateDebugConfiguration(folder, config, token);
             } catch (ex) {
                 utility.showErrorMessage({
+                    type: Type.EXCEPTION,
                     message: String((ex && ex.message) || ex),
                 });
                 return undefined;
@@ -57,62 +106,73 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
     }
 
     private provideDebugConfigurationsAsync(folder: vscode.WorkspaceFolder | undefined, token?: vscode.CancellationToken) {
-        return vscode.window.withProgress({ location: vscode.ProgressLocation.Window }, (p) => {
-            return new Promise((resolve, reject) => {
-                p.report({ message: "Auto generating configuration..." });
-                lsPlugin.resolveMainClass(folder ? folder.uri : undefined).then((res: lsPlugin.IMainClassOption[]) => {
-                    let cache;
-                    cache = {};
-                    const defaultLaunchConfig = {
-                        type: "java",
-                        name: "Debug (Launch) - Current File",
-                        request: "launch",
-                        // tslint:disable-next-line
-                        mainClass: "${file}",
+        return new Promise(async (resolve, _reject) => {
+            const progressReporter = progressProvider.createProgressReporter("Create launch.json", vscode.ProgressLocation.Window);
+            progressReporter.observe(token);
+            const defaultLaunchConfig = {
+                type: "java",
+                name: "Current File",
+                request: "launch",
+                // tslint:disable-next-line
+                mainClass: "${file}",
+            };
+            try {
+                const isOnStandardMode = await utility.waitForStandardMode(progressReporter);
+                if (!isOnStandardMode) {
+                    resolve([defaultLaunchConfig]);
+                    return;
+                }
+
+                if (progressReporter.isCancelled()) {
+                    resolve([defaultLaunchConfig]);
+                    return;
+                }
+                progressReporter.report("Generating Java configuration...");
+                const mainClasses = await lsPlugin.resolveMainClass(folder ? folder.uri : undefined);
+                const cache = {};
+                const launchConfigs = mainClasses.map((item) => {
+                    return {
+                        ...defaultLaunchConfig,
+                        name: this.constructLaunchConfigName(item.mainClass, cache),
+                        mainClass: item.mainClass,
+                        projectName: item.projectName,
                     };
-                    const launchConfigs = res.map((item) => {
-                        return {
-                            ...defaultLaunchConfig,
-                            name: this.constructLaunchConfigName(item.mainClass, item.projectName, cache),
-                            mainClass: item.mainClass,
-                            projectName: item.projectName,
-                        };
-                    });
-                    resolve([defaultLaunchConfig, ...launchConfigs]);
-                }, (ex) => {
-                    p.report({ message: `failed to generate configuration. ${ex}` });
-                    reject(ex);
                 });
-            });
+                if (progressReporter.isCancelled()) {
+                    resolve([defaultLaunchConfig]);
+                    return;
+                }
+                resolve([defaultLaunchConfig, ...launchConfigs]);
+            } catch (ex) {
+                if (ex instanceof utility.JavaExtensionNotEnabledError) {
+                    utility.guideToInstallJavaExtension();
+                } else {
+                    // tslint:disable-next-line
+                    console.error(ex);
+                }
+
+                resolve([defaultLaunchConfig]);
+            } finally {
+                progressReporter.done();
+            }
         });
     }
 
-    private resolveVariables(folder: vscode.WorkspaceFolder, config: vscode.DebugConfiguration): void {
-        // all the properties whose values are string or array of string
-        const keys = ["mainClass", "args", "vmArgs", "modulePaths", "classPaths", "projectName",
-            "env", "sourcePaths", "encoding", "cwd", "hostName"];
-        if (!config) {
-            return;
-        }
-        for (const key of keys) {
-            if (config.hasOwnProperty(key)) {
-                const value = config[key];
-                if (_.isString(value)) {
-                    config[key] = this.resolver.resolveString(folder ? folder.uri : undefined, value);
-                } else if (_.isArray(value)) {
-                    config[key] = _.map(value, (item) =>
-                        _.isString(item) ? this.resolver.resolveString(folder ? folder.uri : undefined, item) : item);
+    private mergePlatformProperties(config: vscode.DebugConfiguration, _folder?: vscode.WorkspaceFolder) {
+        if (config && platformName && config[platformName]) {
+            try {
+                for (const key of Object.keys(config[platformName])) {
+                    config[key] = config[platformName][key];
                 }
+                config[platformName] = undefined;
+            } catch {
+                // do nothing
             }
         }
     }
 
-    private constructLaunchConfigName(mainClass: string, projectName: string, cache: {}) {
-        const prefix = "Debug (Launch)-";
-        let name = prefix + mainClass.substr(mainClass.lastIndexOf(".") + 1);
-        if (projectName !== undefined) {
-            name += `<${projectName}>`;
-        }
+    private constructLaunchConfigName(mainClass: string, cache: { [key: string]: any }) {
+        const name = `${mainClass.substr(mainClass.lastIndexOf(".") + 1)}`;
         if (cache[name] === undefined) {
             cache[name] = 0;
             return name;
@@ -122,59 +182,143 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
         }
     }
 
-    private async heuristicallyResolveDebugConfiguration(folder: vscode.WorkspaceFolder | undefined, config: vscode.DebugConfiguration) {
+    private mergeEnvFile(config: vscode.DebugConfiguration) {
+        const baseEnv = config.env || {};
+        let result = baseEnv;
+        if (config.envFile) {
+            try {
+                if (typeof config.envFile === 'string') {
+                    result = {
+                        ...result,
+                        ...readEnvFile(config.envFile)
+                    };
+                }
+                if (Array.isArray(config.envFile)) {
+                    config.envFile.forEach((f) => {
+                        result = {
+                            ...result,
+                            ...readEnvFile(f)
+                        };
+                    });
+                }
+            } catch (e) {
+                throw new utility.UserError({
+                    message: "Cannot load environment file.",
+                    type: Type.USAGEERROR,
+                });
+            }
+        }
+        config.env = result;
+    }
+
+    private async resolveAndValidateDebugConfiguration(folder: vscode.WorkspaceFolder | undefined, config: vscode.DebugConfiguration,
+                                                       token?: vscode.CancellationToken) {
+        let configCopy: vscode.DebugConfiguration | undefined;
+        const isConfigFromInternal = config.__origin === "internal" /** in-memory configuration from debugger */
+            || config.__configurationTarget /** configuration from launch.json */;
+        if (config.request === "launch" && isConfigFromInternal) {
+            configCopy = _.cloneDeep(config);
+            delete configCopy.__progressId;
+            delete configCopy.noDebug;
+        }
+
+        let progressReporter = progressProvider.getProgressReporter(config.__progressId);
+        if (!progressReporter && config.__progressId) {
+            return undefined;
+        } else if (!progressReporter) {
+            progressReporter = progressProvider.createProgressReporter(utility.launchJobName(config.name, config.noDebug));
+        }
+
+        progressReporter.observe(token);
+        if (progressReporter.isCancelled()) {
+            return undefined;
+        }
+
         try {
+            const isOnStandardMode = await utility.waitForStandardMode(progressReporter);
+            if (!isOnStandardMode || progressReporter.isCancelled()) {
+                return undefined;
+            }
+
             if (this.isUserSettingsDirty) {
                 this.isUserSettingsDirty = false;
                 await updateDebugSettings();
             }
 
-            /**
-             * If no launch.json exists in the current workspace folder
-             * delegate to provideDebugConfigurations api to generate the initial launch.json configurations
-             */
-            if (this.isEmptyConfig(config) && folder) {
-                // Follow the feature request https://github.com/Microsoft/vscode/issues/54213#issuecomment-420965778,
-                // in order to generate launch.json, the resolveDebugConfiguration api must return null explicitly.
-                return null;
-            }
-
-            // If it's the single file case that no workspace folder is opened, generate debug config in memory
-            if (this.isEmptyConfig(config) && !folder) {
+            // If no debug configuration is provided, then generate one in memory.
+            if (this.isEmptyConfig(config)) {
                 config.type = "java";
                 config.name = "Java Debug";
                 config.request = "launch";
             }
 
             if (config.request === "launch") {
-                if (needsBuildWorkspace()) {
-                    try {
-                        const buildResult = await vscode.commands.executeCommand(commands.JAVA_BUILD_WORKSPACE, false);
-                    } catch (err) {
-                        const ans = await utility.showErrorMessageWithTroubleshooting({
-                            message: "Build failed, do you want to continue?",
-                            type: Type.USAGEERROR,
-                            anchor: anchor.BUILD_FAILED,
-                        }, "Proceed", "Abort");
-                        if (ans !== "Proceed") {
-                            return undefined;
-                        }
-                    }
-                }
-
-                const mainClassOption = await this.resolveLaunchConfig(folder ? folder.uri : undefined, config);
+                const mainClassOption = await this.resolveAndValidateMainClass(folder && folder.uri, config, progressReporter);
                 if (!mainClassOption || !mainClassOption.mainClass) { // Exit silently if the user cancels the prompt fix by ESC.
                     // Exit the debug session.
-                    return;
+                    return undefined;
                 }
 
                 config.mainClass = mainClassOption.mainClass;
                 config.projectName = mainClassOption.projectName;
+                if (config.__workspaceFolder && config.__workspaceFolder !== folder) {
+                    folder = config.__workspaceFolder;
+                }
+                // Update the job name if the main class is changed during the resolving of configuration provider.
+                if (configCopy && configCopy.mainClass !== config.mainClass) {
+                    config.name = config.mainClass.substr(config.mainClass.lastIndexOf(".") + 1);
+                    progressReporter.setJobName(utility.launchJobName(config.name, config.noDebug));
+                }
+                if (progressReporter.isCancelled()) {
+                    return undefined;
+                }
+
+                if (needsBuildWorkspace()) {
+                    progressReporter.report("Compiling...");
+                    const proceed = await buildWorkspace({
+                            mainClass: mainClassOption.mainClass,
+                            projectName: mainClassOption.projectName,
+                            isFullBuild: false,
+                        }, progressReporter);
+                    if (!proceed) {
+                        return undefined;
+                    }
+                }
+
+                if (progressReporter.isCancelled()) {
+                    return undefined;
+                }
+
+                progressReporter.report("Resolving launch configuration...");
+                this.mergeEnvFile(config);
+                // If the user doesn't specify 'vmArgs' in launch.json, use the global setting to get the default vmArgs.
+                if (config.vmArgs === undefined) {
+                    const debugSettings: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration("java.debug.settings");
+                    config.vmArgs = debugSettings.vmArgs;
+                }
+                // If the user doesn't specify 'console' in launch.json, use the global setting to get the launch console.
+                if (!config.console) {
+                    const debugSettings: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration("java.debug.settings");
+                    config.console = debugSettings.console;
+                }
+                // If the console is integratedTerminal, don't auto switch the focus to DEBUG CONSOLE.
+                if (config.console === "integratedTerminal" && !config.internalConsoleOptions) {
+                    config.internalConsoleOptions = "neverOpen";
+                }
+
+                if (progressReporter.isCancelled()) {
+                    return undefined;
+                }
 
                 if (_.isEmpty(config.classPaths) && _.isEmpty(config.modulePaths)) {
                     const result = <any[]>(await lsPlugin.resolveClasspath(config.mainClass, config.projectName));
                     config.modulePaths = result[0];
                     config.classPaths = result[1];
+                } else {
+                    config.modulePaths = await this.resolvePath(folder, config.modulePaths, config.mainClass,
+                        config.projectName, true /*isModulePath*/);
+                    config.classPaths = await this.resolvePath(folder, config.classPaths, config.mainClass,
+                        config.projectName, false /*isModulePath*/);
                 }
                 if (_.isEmpty(config.classPaths) && _.isEmpty(config.modulePaths)) {
                     throw new utility.UserError({
@@ -183,16 +327,89 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
                     });
                 }
 
+                if (_.isEmpty(config.javaExec)) {
+                    config.javaExec = await lsPlugin.resolveJavaExecutable(config.mainClass, config.projectName);
+                } else {
+                    if (!fs.existsSync(config.javaExec)) {
+                        throw new utility.UserError({
+                            message: "Java executable file path cannot be accessed, please specify a valid path in the launch.json.",
+                            type: Type.USAGEERROR,
+                        });
+                    }
+                }
+
                 // Add the default launch options to the config.
                 config.cwd = config.cwd || _.get(folder, "uri.fsPath");
+                if (Array.isArray(config.args)) {
+                    config.args = this.concatArgs(config.args);
+                }
+
+                if (Array.isArray(config.vmArgs)) {
+                    config.vmArgs = this.concatArgs(config.vmArgs);
+                }
+
+                if (progressReporter.isCancelled()) {
+                    return undefined;
+                }
+                // Populate the class filters to the debug configuration.
+                await populateStepFilters(config);
+
+                const targetJavaVersion: number = await getJavaVersion(config.javaExec);
+                // Auto add '--enable-preview' vmArgs if the java project enables COMPILER_PB_ENABLE_PREVIEW_FEATURES flag.
+                if (await lsPlugin.detectPreviewFlag(config.mainClass, config.projectName)) {
+                    config.vmArgs = (config.vmArgs || "") + " --enable-preview";
+                    validateRuntimeCompatibility(targetJavaVersion);
+                }
+
+                // Add more helpful vmArgs.
+                await addMoreHelpfulVMArgs(config, targetJavaVersion);
+
+                if (!config.shortenCommandLine || config.shortenCommandLine === "auto") {
+                    config.shortenCommandLine = await getShortenApproachForCLI(config, targetJavaVersion);
+                }
+
+                // VS Code internal console uses UTF-8 to display output by default.
+                if (config.console === "internalConsole" && !config.encoding) {
+                    config.encoding = "UTF-8";
+                }
             } else if (config.request === "attach") {
-                if (!config.hostName || !config.port) {
+                if (config.hostName && config.port && Number.isInteger(Number(config.port))) {
+                    config.port = Number(config.port);
+                    config.processId = undefined;
+                    // Continue if the hostName and port are configured.
+                } else if (config.processId !== undefined) {
+                    // tslint:disable-next-line
+                    if (config.processId === "${command:PickJavaProcess}") {
+                        return undefined;
+                    }
+
+                    const pid: number = Number(config.processId);
+                    if (Number.isNaN(pid)) {
+                        vscode.window.showErrorMessage(`The processId config '${config.processId}' is not a valid process id.`);
+                        return undefined;
+                    }
+
+                    const javaProcess = await resolveJavaProcess(pid);
+                    if (!javaProcess) {
+                        vscode.window.showErrorMessage(`Attach to process: pid '${config.processId}' is not a debuggable Java process. `
+                            + `Please make sure the process has turned on debug mode using vmArgs like `
+                            + `'-agentlib:jdwp=transport=dt_socket,server=y,address=5005.'`);
+                        return undefined;
+                    }
+
+                    config.processId = undefined;
+                    config.hostName = javaProcess.hostName;
+                    config.port = javaProcess.debugPort;
+                } else {
                     throw new utility.UserError({
-                        message: "Please specify the host name and the port of the remote debuggee in the launch.json.",
+                        message: "Please specify the hostName/port directly, or provide the processId of the remote debuggee in the launch.json.",
                         type: Type.USAGEERROR,
                         anchor: anchor.ATTACH_CONFIG_ERROR,
                     });
                 }
+
+                // Populate the class filters to the debug configuration.
+                await populateStepFilters(config);
             } else {
                 throw new utility.UserError({
                     message: `Request type "${config.request}" is not supported. Only "launch" and "attach" are supported.`,
@@ -201,37 +418,119 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
                 });
             }
 
-            if (Array.isArray(config.args)) {
-                config.args = this.concatArgs(config.args);
+            if (token?.isCancellationRequested || progressReporter.isCancelled()) {
+                return undefined;
             }
 
-            if (Array.isArray(config.vmArgs)) {
-                config.vmArgs = this.concatArgs(config.vmArgs);
-            }
-
-            const debugServerPort = await lsPlugin.startDebugSession();
-            if (debugServerPort) {
-                config.debugServer = debugServerPort;
-                return config;
-            } else {
-                // Information for diagnostic:
-                console.log("Cannot find a port for debugging session");
-                throw new Error("Failed to start debug server.");
-            }
+            delete config.__progressId;
+            return config;
         } catch (ex) {
+            if (ex instanceof utility.JavaExtensionNotEnabledError) {
+                utility.guideToInstallJavaExtension();
+                return undefined;
+            }
             if (ex instanceof utility.UserError) {
                 utility.showErrorMessageWithTroubleshooting(ex.context);
                 return undefined;
             }
 
-            const errorMessage = (ex && ex.message) || ex;
-            utility.showErrorMessageWithTroubleshooting({
-                message: String(errorMessage),
-                type: Type.EXCEPTION,
-                details: utility.formatErrorProperties(ex),
-            });
+            utility.showErrorMessageWithTroubleshooting(utility.convertErrorToMessage(ex));
+            return undefined;
+        } finally {
+            if (configCopy && config.mainClass) {
+                configCopy.name = config.name;
+                configCopy.mainClass = config.mainClass;
+                configCopy.projectName = config.projectName;
+                configCopy.__workspaceFolder = folder;
+                lastUsedLaunchConfig = configCopy;
+            }
+
+            progressReporter.done();
+        }
+    }
+
+    private async resolvePath(folder: vscode.WorkspaceFolder | undefined, pathArray: string[], mainClass: string,
+                              projectName: string, isModulePath: boolean): Promise<string[]> {
+        if (_.isEmpty(pathArray)) {
+            return [];
+        }
+
+        const pathVariables: string[] = [ClasspathVariable.Auto, ClasspathVariable.Runtime, ClasspathVariable.Test];
+        const containedVariables: string[] = pathArray.filter((cp: string) => pathVariables.includes(cp));
+        if (_.isEmpty(containedVariables)) {
+            return this.filterExcluded(folder, pathArray);
+        }
+
+        const scope: string | undefined = this.mergeScope(containedVariables);
+        const response: any[] = <any[]> await lsPlugin.resolveClasspath(mainClass, projectName, scope);
+        const resolvedPaths: string[] = isModulePath ? response?.[0] : response?.[1];
+        if (!resolvedPaths) {
+            // tslint:disable-next-line:no-console
+            console.log("The Java Language Server failed to resolve the classpaths/modulepaths");
+        }
+        const paths: string[] = [];
+        let replaced: boolean = false;
+        for (const p of pathArray) {
+            for (const splitPath of p.split(process.platform === 'win32' ? ';' : ':')) {
+                if (pathVariables.includes(splitPath)) {
+                    if (!replaced) {
+                        paths.push(...resolvedPaths);
+                        replaced = true;
+                    }
+                    continue;
+                }
+                paths.push(splitPath);
+            }
+        }
+        return this.filterExcluded(folder, paths);
+    }
+
+    private async filterExcluded(folder: vscode.WorkspaceFolder | undefined, paths: string[]): Promise<string[]> {
+        const result: string[] = [];
+        const excludes: Map<string, boolean> = new Map<string, boolean>();
+        for (const p of paths) {
+            if (p.startsWith("!")) {
+                let exclude = p.substr(1);
+                if (!path.isAbsolute(exclude)) {
+                    exclude = path.join(folder?.uri.fsPath || "", exclude);
+                }
+                // use Uri to normalize the fs path
+                excludes.set(vscode.Uri.file(exclude).fsPath, this.isFilePath(exclude));
+                continue;
+            }
+
+            result.push(vscode.Uri.file(p).fsPath);
+        }
+
+        return result.filter((r) => {
+            for (const [excludedPath, isFile] of excludes.entries()) {
+                if (isFile && r === excludedPath) {
+                    return false;
+                }
+
+                if (!isFile && r.startsWith(excludedPath)) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+    }
+
+    private mergeScope(scopes: string[]): string | undefined {
+        if (scopes.includes(ClasspathVariable.Test)) {
+            return "test";
+        }
+
+        if (scopes.includes(ClasspathVariable.Auto)) {
             return undefined;
         }
+
+        if (scopes.includes(ClasspathVariable.Runtime)) {
+            return "runtime";
+        }
+
+        return undefined;
     }
 
     /**
@@ -241,8 +540,8 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
         return _.join(_.map(args, (arg: any): string => {
             const str = String(arg);
             // if it has quotes or spaces, use double quotes to wrap it
-            if (/['"\s]/.test(str)) {
-                return "\"" + str.replace(/(['"\\])/g, "\\$1") + "\"";
+            if (/["\s]/.test(str)) {
+                return "\"" + str.replace(/(["\\])/g, "\\$1") + "\"";
             }
             return str;
 
@@ -258,38 +557,84 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
         return Object.keys(config).filter((key: string) => key !== "noDebug").length === 0;
     }
 
-    private async resolveLaunchConfig(folder: vscode.Uri | undefined, config: vscode.DebugConfiguration): Promise<lsPlugin.IMainClassOption> {
-        if (!config.mainClass || this.isFile(config.mainClass)) {
-            const currentFile = config.mainClass ||  _.get(vscode.window.activeTextEditor, "document.uri.fsPath");
-            if (currentFile) {
-                const mainEntries = await lsPlugin.resolveMainMethod(vscode.Uri.file(currentFile));
-                if (mainEntries.length === 1) {
-                    return mainEntries[0];
-                } else if (mainEntries.length > 1) {
-                    return await this.showMainClassQuickPick(this.formatMainClassOptions(mainEntries),
-                        `Multiple main classes found in the file '${path.basename(currentFile)}', please select one first.`);
+    private async resolveAndValidateMainClass(folder: vscode.Uri | undefined, config: vscode.DebugConfiguration,
+                                              progressReporter: IProgressReporter): Promise<lsPlugin.IMainClassOption | undefined> {
+        // Validate it if the mainClass is already set in launch configuration.
+        if (config.mainClass && !this.isFilePath(config.mainClass)) {
+            progressReporter.report("Resolving main class...");
+            const containsExternalClasspaths = !_.isEmpty(config.classPaths) || !_.isEmpty(config.modulePaths);
+            const validationResponse = await lsPlugin.validateLaunchConfig(config.mainClass, config.projectName, containsExternalClasspaths, folder);
+            if (progressReporter.isCancelled()) {
+                return undefined;
+            } else if (!validationResponse.mainClass.isValid || !validationResponse.projectName.isValid) {
+                return this.fixMainClass(folder, config, validationResponse, progressReporter);
+            }
+
+            return {
+                mainClass: config.mainClass,
+                projectName: config.projectName,
+            };
+        }
+
+        return this.resolveMainClass(config, progressReporter);
+    }
+
+    private async resolveMainClass(config: vscode.DebugConfiguration, progressReporter: IProgressReporter):
+        Promise<lsPlugin.IMainClassOption | undefined> {
+        if (config.projectName) {
+            progressReporter.report("Resolving main class...");
+            if (this.isFilePath(config.mainClass)) {
+                const mainEntries = await lsPlugin.resolveMainMethod(vscode.Uri.file(config.mainClass));
+                if (progressReporter.isCancelled()) {
+                    return undefined;
+                } else if (mainEntries.length) {
+                    if (!mainClassPicker.isAutoPicked(mainEntries)) {
+                        progressReporter.hide(true);
+                    }
+                    return mainClassPicker.showQuickPick(mainEntries, "Please select a main class you want to run.");
                 }
             }
 
-            const hintMessage = currentFile ?
-                `No main class found in the file '${path.basename(currentFile)}', please select main class<project name> again.` :
-                "Please select main class<project name>.";
-            return await this.promptMainClass(folder, hintMessage);
+            return this.promptMainClassUnderProject(config.projectName, progressReporter, "Please select a main class you wan to run");
         }
 
-        const containsExternalClasspaths = !_.isEmpty(config.classPaths) || !_.isEmpty(config.modulePaths);
-        const validationResponse = await lsPlugin.validateLaunchConfig(folder, config.mainClass, config.projectName, containsExternalClasspaths);
-        if (!validationResponse.mainClass.isValid || !validationResponse.projectName.isValid) {
-            return await this.fixMainClass(folder, config, validationResponse);
+        // Try to resolve main class from current file
+        const currentFile = config.mainClass || vscode.window.activeTextEditor?.document.uri.fsPath;
+        if (currentFile) {
+            const mainEntries = await lsPlugin.resolveMainMethod(vscode.Uri.file(currentFile));
+            if (progressReporter.isCancelled()) {
+                return undefined;
+            } else if (mainEntries.length) {
+                if (!mainClassPicker.isAutoPicked(mainEntries)) {
+                    progressReporter.hide(true);
+                }
+                return mainClassPicker.showQuickPick(mainEntries, "Please select a main class you want to run.");
+            }
         }
 
-        return {
-            mainClass: config.mainClass,
-            projectName: config.projectName,
-        };
+        // If current file is not executable, run previously used launch config.
+        if (lastUsedLaunchConfig) {
+            Object.assign(config, lastUsedLaunchConfig);
+            progressReporter.setJobName(utility.launchJobName(config.name, config.noDebug));
+            progressReporter.report("Resolving main class...");
+            return {
+                mainClass: config.mainClass,
+                projectName: config.projectName,
+            };
+        }
+
+        progressReporter.report("Resolving main class...");
+        const hintMessage = currentFile ?
+        `The file '${path.basename(currentFile)}' is not executable, please select a main class you want to run.` :
+        "Please select a main class you want to run.";
+        return this.promptMainClassUnderPath(undefined, progressReporter, hintMessage);
     }
 
-    private isFile(filePath: string): boolean {
+    private isFilePath(filePath: string): boolean {
+        if (!filePath) {
+            return false;
+        }
+
         try {
             return fs.lstatSync(filePath).isFile();
         } catch (error) {
@@ -298,31 +643,60 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
         }
     }
 
+    private getValidationErrorMessage(error: lsPlugin.IValidationResult): string {
+        switch (error.kind) {
+            case lsPlugin.CONFIGERROR_INVALID_CLASS_NAME:
+                return "ConfigError: mainClass was configured with an invalid class name.";
+            case lsPlugin.CONFIGERROR_MAIN_CLASS_NOT_EXIST:
+                return "ConfigError: mainClass does not exist.";
+            case lsPlugin.CONFIGERROR_MAIN_CLASS_NOT_UNIQUE:
+                return "ConfigError: mainClass is not unique in the workspace";
+            case lsPlugin.CONFIGERROR_INVALID_JAVA_PROJECT:
+                return "ConfigError: could not find a Java project with the configured projectName.";
+        }
+
+        return "ConfigError: Invalid mainClass/projectName configs.";
+    }
+
     private async fixMainClass(folder: vscode.Uri | undefined, config: vscode.DebugConfiguration,
-                               validationResponse: lsPlugin.ILaunchValidationResponse): Promise<lsPlugin.IMainClassOption | undefined> {
+                               validationResponse: lsPlugin.ILaunchValidationResponse, progressReporter: IProgressReporter):
+        Promise<lsPlugin.IMainClassOption | undefined> {
         const errors: string[] = [];
         if (!validationResponse.mainClass.isValid) {
             errors.push(String(validationResponse.mainClass.message));
+            const errorLog: Error = {
+                name: "error",
+                message: this.getValidationErrorMessage(validationResponse.mainClass),
+            };
+            setUserError(errorLog);
+            sendError(errorLog);
         }
 
         if (!validationResponse.projectName.isValid) {
             errors.push(String(validationResponse.projectName.message));
+            const errorLog: Error = {
+                name: "error",
+                message: this.getValidationErrorMessage(validationResponse.projectName),
+            };
+            setUserError(errorLog);
+            sendError(errorLog);
         }
 
         if (validationResponse.proposals && validationResponse.proposals.length) {
+            progressReporter.hide(true);
             const answer = await utility.showErrorMessageWithTroubleshooting({
                 message: errors.join(os.EOL),
                 type: Type.USAGEERROR,
                 anchor: anchor.FAILED_TO_RESOLVE_CLASSPATH,
+                bypassLog: true, // Avoid logging the raw user input in the logger for privacy.
             }, "Fix");
             if (answer === "Fix") {
-                const pickItems: IMainClassQuickPickItem[] = this.formatMainClassOptions(validationResponse.proposals);
-                const selectedFix: lsPlugin.IMainClassOption =
-                    await this.showMainClassQuickPick(pickItems, "Please select main class<project name>.", false);
+                const selectedFix = await mainClassPicker.showQuickPick(validationResponse.proposals,
+                    "Please select main class<project name>.", false);
                 if (selectedFix) {
-                    logger.log(Type.USAGEDATA, {
+                    sendInfo("", {
                         fix: "yes",
-                        fixMessage: errors.join(os.EOL),
+                        fixMessage: "Fix the configs of mainClass and projectName",
                     });
                     await this.persistMainClassOption(folder, config, selectedFix);
                 }
@@ -330,13 +704,14 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
                 return selectedFix;
             }
             // return undefined if the user clicks "Learn More".
-            return;
+            return undefined;
         }
 
         throw new utility.UserError({
             message: errors.join(os.EOL),
             type: Type.USAGEERROR,
             anchor: anchor.FAILED_TO_RESOLVE_CLASSPATH,
+            bypassLog: true, // Avoid logging the raw user input in the logger for privacy.
         });
     }
 
@@ -360,106 +735,47 @@ export class JavaDebugConfigurationProvider implements vscode.DebugConfiguration
         }
     }
 
-    private async promptMainClass(folder: vscode.Uri | undefined, hintMessage?: string): Promise<lsPlugin.IMainClassOption | undefined> {
+    private async promptMainClassUnderPath(folder: vscode.Uri | undefined, progressReporter: IProgressReporter, hintMessage?: string):
+        Promise<lsPlugin.IMainClassOption | undefined> {
         const res = await lsPlugin.resolveMainClass(folder);
-        if (res.length === 0) {
+        if (progressReporter.isCancelled()) {
+            return undefined;
+        } else if (res.length === 0) {
+            const workspaceFolder = folder ? vscode.workspace.getWorkspaceFolder(folder) : undefined;
             throw new utility.UserError({
-                message: "Cannot find a class with the main method.",
+                message: `Cannot find a class with the main method${ workspaceFolder ? " in the folder '" + workspaceFolder.name + "'" : ""}.`,
                 type: Type.USAGEERROR,
                 anchor: anchor.CANNOT_FIND_MAIN_CLASS,
             });
         }
 
-        const pickItems: IMainClassQuickPickItem[] = this.formatRecentlyUsedMainClassOptions(res);
-        const selected = await this.showMainClassQuickPick(pickItems, hintMessage || "Select main class<project name>");
-        if (selected) {
-            this.debugHistory.updateMRUTimestamp(selected);
+        if (!mainClassPicker.isAutoPicked(res)) {
+            progressReporter.hide(true);
+        }
+        return mainClassPicker.showQuickPickWithRecentlyUsed(res, hintMessage || "Select main class<project name>");
+    }
+
+    private async promptMainClassUnderProject(projectName: string, progressReporter: IProgressReporter, hintMessage?: string):
+        Promise<lsPlugin.IMainClassOption | undefined> {
+        const res = await lsPlugin.resolveMainClassFromProject(projectName);
+        if (progressReporter.isCancelled()) {
+            return undefined;
+        } else if (res.length === 0) {
+            throw new utility.UserError({
+                message: `Cannot find a class with the main method in the project '${projectName}'.`,
+                type: Type.USAGEERROR,
+                anchor: anchor.CANNOT_FIND_MAIN_CLASS,
+            });
         }
 
-        return selected;
-    }
-
-    private async showMainClassQuickPick(pickItems: IMainClassQuickPickItem[], quickPickHintMessage: string, autoPick: boolean = true):
-        Promise<lsPlugin.IMainClassOption | undefined> {
-        // return undefined when the user cancels QuickPick by pressing ESC.
-        const selected = (pickItems.length === 1 && autoPick) ?
-            pickItems[0] : await vscode.window.showQuickPick(pickItems, { placeHolder: quickPickHintMessage });
-
-        return selected && selected.item;
-    }
-
-    private formatRecentlyUsedMainClassOptions(options: lsPlugin.IMainClassOption[]): IMainClassQuickPickItem[] {
-        // Sort the Main Class options with the recently used timestamp.
-        options.sort((a: lsPlugin.IMainClassOption, b: lsPlugin.IMainClassOption) => {
-            return this.debugHistory.getMRUTimestamp(b) - this.debugHistory.getMRUTimestamp(a);
-        });
-
-        const mostRecentlyUsedOption: lsPlugin.IMainClassOption = (options.length && this.debugHistory.contains(options[0])) ? options[0] : undefined;
-        const isMostRecentlyUsed = (option: lsPlugin.IMainClassOption): boolean => {
-            return mostRecentlyUsedOption
-                && mostRecentlyUsedOption.mainClass === option.mainClass
-                && mostRecentlyUsedOption.projectName === option.projectName;
-        };
-        const isFromActiveEditor = (option: lsPlugin.IMainClassOption): boolean => {
-            const activeEditor: vscode.TextEditor = vscode.window.activeTextEditor;
-            const currentActiveFile: string = _.get(activeEditor, "document.uri.fsPath");
-            return option.filePath && currentActiveFile && path.relative(option.filePath, currentActiveFile) === "";
-        };
-        const isPrivileged = (option: lsPlugin.IMainClassOption): boolean => {
-            return isMostRecentlyUsed(option) || isFromActiveEditor(option);
-        };
-
-        // Show the most recently used Main Class as the first one,
-        // then the Main Class from Active Editor as second,
-        // finally other Main Class.
-        const adjustedOptions: lsPlugin.IMainClassOption[] = [];
-        options.forEach((option: lsPlugin.IMainClassOption) => {
-            if (isPrivileged(option)) {
-                adjustedOptions.push(option);
-            }
-        });
-        options.forEach((option: lsPlugin.IMainClassOption) => {
-            if (!isPrivileged(option)) {
-                adjustedOptions.push(option);
-            }
-        });
-
-        const pickItems: IMainClassQuickPickItem[] = this.formatMainClassOptions(adjustedOptions);
-        pickItems.forEach((pickItem: IMainClassQuickPickItem) => {
-            const adjustedDetail = [];
-            if (isMostRecentlyUsed(pickItem.item)) {
-                adjustedDetail.push("$(clock) recently used");
-            }
-
-            if (isFromActiveEditor(pickItem.item)) {
-                adjustedDetail.push(`$(file-text) active editor (${path.basename(pickItem.item.filePath)})`);
-            }
-
-            pickItem.detail = adjustedDetail.join(", ");
-        });
-
-        return pickItems;
-    }
-
-    private formatMainClassOptions(options: lsPlugin.IMainClassOption[]): IMainClassQuickPickItem[] {
-        return options.map((item) => {
-            let label = item.mainClass;
-            const description = item.filePath ? path.basename(item.filePath) : "";
-            if (item.projectName) {
-                label += `<${item.projectName}>`;
-            }
-
-            return {
-                label,
-                description,
-                detail: null,
-                item,
-            };
-        });
+        if (!mainClassPicker.isAutoPicked(res)) {
+            progressReporter.hide(true);
+        }
+        return mainClassPicker.showQuickPickWithRecentlyUsed(res, hintMessage || "Select main class<project name>");
     }
 }
 
-async function updateDebugSettings() {
+async function updateDebugSettings(event?: vscode.ConfigurationChangeEvent) {
     const debugSettingsRoot: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration("java.debug");
     if (!debugSettingsRoot) {
         return;
@@ -468,18 +784,49 @@ async function updateDebugSettings() {
     const javaHome = await utility.getJavaHome();
     if (debugSettingsRoot.settings && Object.keys(debugSettingsRoot.settings).length) {
         try {
-            console.log("settings:", await commands.executeJavaLanguageServerCommand(commands.JAVA_UPDATE_DEBUG_SETTINGS, JSON.stringify(
-                { ...debugSettingsRoot.settings, logLevel, javaHome })));
+            const stepFilters = {
+                skipClasses: await substituteFilterVariables(debugSettingsRoot.settings.stepping.skipClasses),
+                skipSynthetics: debugSettingsRoot.settings.stepping.skipSynthetics,
+                skipStaticInitializers: debugSettingsRoot.settings.stepping.skipStaticInitializers,
+                skipConstructors: debugSettingsRoot.settings.stepping.skipConstructors,
+            };
+            const exceptionFilters = {
+                exceptionTypes: debugSettingsRoot.settings.exceptionBreakpoint.exceptionTypes,
+                allowClasses: debugSettingsRoot.settings.exceptionBreakpoint.allowClasses,
+                skipClasses: await substituteFilterVariables(debugSettingsRoot.settings.exceptionBreakpoint.skipClasses),
+            };
+
+            const asyncJDWP: string = debugSettingsRoot.settings.jdwp.async;
+            const settings = await commands.executeJavaLanguageServerCommand(commands.JAVA_UPDATE_DEBUG_SETTINGS, JSON.stringify(
+                {
+                    ...debugSettingsRoot.settings,
+                    logLevel,
+                    javaHome,
+                    stepFilters,
+                    exceptionFilters,
+                    exceptionFiltersUpdated: event &&
+                        (event.affectsConfiguration("java.debug.settings.exceptionBreakpoint.skipClasses")
+                        || event.affectsConfiguration("java.debug.settings.exceptionBreakpoint.allowClasses")
+                        || event.affectsConfiguration("java.debug.settings.exceptionBreakpoint.exceptionTypes")),
+                    limitOfVariablesPerJdwpRequest: Math.max(debugSettingsRoot.settings.jdwp.limitOfVariablesPerJdwpRequest, 1),
+                    jdwpRequestTimeout: Math.max(debugSettingsRoot.settings.jdwp.requestTimeout, 100),
+                    asyncJDWP,
+                }));
+            if (logLevel === "FINE") {
+                // tslint:disable-next-line:no-console
+                console.log("settings:", settings);
+            }
         } catch (err) {
             // log a warning message and continue, since update settings failure should not block debug session
-            console.log("Cannot update debug settings.", err)
+            // tslint:disable-next-line:no-console
+            console.log("Cannot update debug settings.", err);
         }
     }
 }
 
 function needsBuildWorkspace(): boolean {
-    const debugSettingsRoot: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration("java.debug.settings");
-    return debugSettingsRoot ? debugSettingsRoot.forceBuildBeforeLaunch : true;
+    const javaConfig: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration("java");
+    return javaConfig?.debug?.settings?.forceBuildBeforeLaunch;
 }
 
 function convertLogLevel(commonLogLevel: string) {
@@ -498,26 +845,21 @@ function convertLogLevel(commonLogLevel: string) {
     }
 }
 
-export interface IMainClassQuickPickItem extends vscode.QuickPickItem {
-    item: lsPlugin.IMainClassOption;
+// from vscode-js-debug https://github.com/microsoft/vscode-js-debug/blob/master/src/targets/node/nodeLauncherBase.ts
+function readEnvFile(file: string): { [key: string]: string } {
+    if (!fs.existsSync(file)) {
+        return {};
+    }
+
+    const buffer = stripBOM(fs.readFileSync(file, "utf8"));
+    const env = dotenv.parse(Buffer.from(buffer));
+
+    return env;
 }
 
-class MostRecentlyUsedHistory {
-    private cache: { [key: string]: number } = {};
-
-    public getMRUTimestamp(mainClassOption: lsPlugin.IMainClassOption): number {
-        return this.cache[this.getKey(mainClassOption)] || 0;
+function stripBOM(s: string): string {
+    if (s && s[0] === "\uFEFF") {
+        s = s.substr(1);
     }
-
-    public updateMRUTimestamp(mainClassOption: lsPlugin.IMainClassOption): void {
-        this.cache[this.getKey(mainClassOption)] = Date.now();
-    }
-
-    public contains(mainClassOption: lsPlugin.IMainClassOption): boolean {
-        return Boolean(this.cache[this.getKey(mainClassOption)]);
-    }
-
-    private getKey(mainClassOption: lsPlugin.IMainClassOption): string {
-        return mainClassOption.mainClass + "|" + mainClassOption.projectName;
-    }
+    return s;
 }

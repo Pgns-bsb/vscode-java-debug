@@ -10,19 +10,24 @@
             "args": ["--extensionDevelopmentPath=${workspaceRoot}" ],
             "stopOnEntry": false,
             "sourceMaps": true,
-            "outFiles": [ "${workspaceRoot}/out/src/**/*.js" ],
-            "preLaunchTask": "npm: watch"
+            "outFiles": [ "${workspaceRoot}/dist/**/*.js" ],
+            "preLaunchTask": "npm: watch",
+            "env": {
+              "DEBUG_VSCODE_JAVA":"true"
+            }
         },
         {
-            "name": "Launch Tests",
+            "name": "Extension Tests",
             "type": "extensionHost",
             "request": "launch",
             "runtimeExecutable": "${execPath}",
-            "args": ["--extensionDevelopmentPath=${workspaceRoot}", "--extensionTestsPath=${workspaceRoot}/out/test" ],
-            "stopOnEntry": false,
+            "args": [
+              "--extensionDevelopmentPath=${workspaceFolder}",
+              "--extensionTestsPath=${workspaceFolder}/out/test/suite/index"
+            ],
             "sourceMaps": true,
-            "outFiles": [ "${workspaceRoot}/out/test/**/*.js" ],
-            "preLaunchTask": "npm: watch"
-        }
+            "outFiles": ["${workspaceFolder}/out/test/**/*.js"],
+            "preLaunchTask": "npm: compile"
+          }
     ]
 }

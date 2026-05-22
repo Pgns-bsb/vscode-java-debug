@@ -4,16 +4,16 @@
 import * as vscode from "vscode";
 
 import * as anchor from "./anchor";
-import { HCR_EVENT, JAVA_LANGID } from "./constants";
+import { JAVA_LANGID } from "./constants";
 import * as utility from "./utility";
 
 const suppressedReasons: Set<string> = new Set();
 
-const YES_BUTTON: string = "Yes";
+export const YES_BUTTON: string = "Yes";
 
-const NO_BUTTON: string = "No";
+export const NO_BUTTON: string = "No";
 
-const NEVER_BUTTON: string = "Not show again";
+const NEVER_BUTTON: string = "Do not show again";
 
 enum HcrChangeType {
     ERROR = "ERROR",
@@ -24,6 +24,20 @@ enum HcrChangeType {
 }
 
 export function initializeHotCodeReplace(context: vscode.ExtensionContext) {
+    vscode.commands.executeCommand("setContext", "javaHotReload", getHotReloadFlag());
+    vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("java.debug.settings.hotCodeReplace")) {
+            vscode.commands.executeCommand("setContext", "javaHotReload", getHotReloadFlag());
+        }
+    });
+    vscode.debug.onDidStartDebugSession((session) => {
+        if (session?.configuration.noDebug && !vscode.debug.activeDebugSession) {
+            vscode.commands.executeCommand("setContext", "javaHotReloadOn", false);
+        }
+    });
+    vscode.debug.onDidChangeActiveDebugSession((session) => {
+        vscode.commands.executeCommand("setContext", "javaHotReloadOn", session && !session.configuration.noDebug);
+    });
     context.subscriptions.push(vscode.debug.onDidTerminateDebugSession((session) => {
         const t = session ? session.type : undefined;
         if (t === JAVA_LANGID) {
@@ -32,12 +46,14 @@ export function initializeHotCodeReplace(context: vscode.ExtensionContext) {
     }));
 }
 
-export function handleHotCodeReplaceCustomEvent(hcrEvent) {
+export function handleHotCodeReplaceCustomEvent(hcrEvent: vscode.DebugSessionCustomEvent) {
     if (hcrEvent.body.changeType === HcrChangeType.BUILD_COMPLETE) {
-        return vscode.window.withProgress({ location: vscode.ProgressLocation.Window }, (progress) => {
-            progress.report({ message: "Applying code changes..." });
-            return hcrEvent.session.customRequest("redefineClasses");
-        });
+        if (getHotReloadFlag() === "auto") {
+            return vscode.window.withProgress({ location: vscode.ProgressLocation.Window }, (progress) => {
+                progress.report({ message: "Applying code changes..." });
+                return hcrEvent.session.customRequest("redefineClasses");
+            });
+        }
     }
 
     if (hcrEvent.body.changeType === HcrChangeType.ERROR || hcrEvent.body.changeType === HcrChangeType.WARNING) {
@@ -54,4 +70,9 @@ export function handleHotCodeReplaceCustomEvent(hcrEvent) {
             });
         }
     }
+    return undefined;
+}
+
+function getHotReloadFlag(): string {
+    return vscode.workspace.getConfiguration("java.debug.settings").get("hotCodeReplace") || "manual";
 }
