@@ -8,5 +8,8 @@
     },
     "files.watcherExclude": {
         "**/target": true
-    }
+    },
+    "cSpell.words": [
+        "Informations"
+    ]
 }
